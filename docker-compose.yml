@@ -80,6 +80,10 @@ services:
       chromadb:
         condition: service_started
     restart: unless-stopped
+    # Default Docker /dev/shm (64MB) is too small for vLLM's v1 multiprocess
+    # engine (APIServer <-> EngineCore IPC), causing the EngineCore subprocess
+    # to die silently during startup with no captured traceback.
+    shm_size: '4gb'
 
   chromadb:
     image: docker.io/chromadb/chroma:latest
