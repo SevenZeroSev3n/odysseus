@@ -660,14 +660,79 @@ def test_llama_cpp_linux_bootstrap_checks_cudart_before_cuda_build():
     assert script.index('_odysseus_has_cudart') < script.index('DGGML_CUDA=ON')
 
 
-def test_llama_cpp_linux_bootstrap_cuda_cmake_present_when_cudart_found():
-    """The CUDA cmake command must still be present (inside the cudart-present branch)."""
+def test_llama_cpp_linux_bootstrap_cuda_cmake_present_when_cudart_and_cublas_found():
+    """The CUDA cmake command must still be present (inside the cudart+cublas branch)."""
     runner_lines = []
     _append_llama_cpp_linux_accel_build_lines(runner_lines)
     script = "\n".join(runner_lines)
 
     assert 'cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON' in script
-    assert 'CUDA nvcc + cudart found' in script
+    assert 'CUDA nvcc + cudart + cublas found' in script
+    assert 'if _odysseus_has_cudart; then' in script
+    assert 'if [ -n "$_odysseus_cublas_dir" ]; then' in script
+
+
+def test_llama_cpp_linux_bootstrap_checks_cublas_before_cuda_build():
+    """cublas dir-resolution helper and all required paths must appear before the CUDA cmake command.
+
+    A pip-installed CUDA wheel set (e.g. pulled in as a minimal JIT/runtime
+    dependency for FlashInfer) can ship nvcc+cudart without cuBLAS, since
+    cuBLAS is its own pip package (nvidia-cublas-cuXX) installed to a SIBLING
+    site-packages directory, not inside the nvcc package's own directory.
+    cmake's FindCUDAToolkit anchors its component search to the detected
+    compiler's install root, so "CUDA Toolkit found" prints successfully but
+    the later generate step still dies with "CUDA::cublas ... target was not
+    found" after minutes of build work. A boolean existence check isn't
+    enough either — ldconfig can report a real system libcublas.so that still
+    lives outside whatever root cmake locked onto, so _odysseus_cublas_libdir
+    resolves the actual directory so it can be symlinked into cmake's root.
+    """
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+
+    assert '_odysseus_cublas_libdir' in script
+    assert '_odysseus_link_cublas_into_toolkit' in script
+    assert "grep 'libcublas\\.so'" in script
+    assert '"$_cuh/lib64" "$_cuh/lib" /usr/local/cuda/lib64 /usr/local/cuda/lib' in script
+    # sibling pip package layout: nvidia/cublas, nvidia/cu13, nvidia/cu12
+    assert '"$_cuparent/cublas/lib" "$_cuparent/cu13/lib" "$_cuparent/cu12/lib"' in script
+    assert script.index('_odysseus_cublas_libdir') < script.index('DGGML_CUDA=ON')
+
+
+def test_llama_cpp_linux_bootstrap_links_cublas_and_persists_ld_library_path():
+    """When cublas is found outside cmake's toolkit root, it must be symlinked in and LD_LIBRARY_PATH persisted."""
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+
+    assert 'ln -sf "$f" "$_target/$(basename "$f")"' in script
+    assert 'echo "export LD_LIBRARY_PATH=\\"$_odysseus_cublas_dir:\\${LD_LIBRARY_PATH:-}\\"" > ~/.config/odysseus-llama-cpp-env' in script
+
+
+def test_llama_cpp_linux_bootstrap_cuda_build_failure_falls_back_to_cpu():
+    """If the CUDA cmake/build still fails despite cudart+cublas detection, retry as CPU-only instead of dying."""
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+
+    assert '_odysseus_build_llama_cpu_only' in script
+    assert 'WARNING: CUDA build failed despite detecting cudart+cublas — falling back to a CPU-only build.' in script
+
+
+def test_llama_cpp_linux_bootstrap_cudart_without_cublas_warns_and_falls_back():
+    """When cudart exists but cublas is absent anywhere, the script must warn and use CPU-only cmake."""
+    runner_lines = []
+    _append_llama_cpp_linux_accel_build_lines(runner_lines)
+    script = "\n".join(runner_lines)
+
+    assert 'WARNING: cudart found but CUDA BLAS library (libcublas.so) is not visible anywhere on this host — building llama-server for CPU only.' in script
+    assert 'pip install --user nvidia-cublas-cu13' in script
+    # The cublas-missing branch's CPU fallback must appear before the
+    # cudart-missing branch's warning further down the same if/else chain.
+    cublas_missing_warn = 'WARNING: cudart found but CUDA BLAS library'
+    cudart_missing_warn = 'WARNING: nvcc found but CUDA runtime (libcudart.so) is not visible'
+    assert script.index(cublas_missing_warn) < script.index(cudart_missing_warn)
 
 
 def test_llama_cpp_linux_bootstrap_nvcc_without_cudart_warns_and_falls_back():

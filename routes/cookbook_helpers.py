@@ -1007,15 +1007,82 @@ def _append_llama_cpp_linux_accel_build_lines(runner_lines: list[str]) -> None:
     runner_lines.append('        ls "${_cuh%/cuda_nvcc}/cuda_runtime/lib/libcudart.so"* &>/dev/null && return 0')
     runner_lines.append('        return 1')
     runner_lines.append('      }')
+    # cudart alone is not sufficient either — a minimal pip CUDA wheel set
+    # (e.g. pulled in as a JIT/runtime dependency for FlashInfer) can ship
+    # nvcc+cudart without cuBLAS, since cuBLAS is its own pip package
+    # (nvidia-cublas-cuXX) that installs to a SIBLING site-packages directory
+    # (nvidia/cublas/lib), not inside the nvcc package's own directory
+    # (nvidia/cu13). cmake's FindCUDAToolkit anchors its component search to
+    # the detected compiler's install root, so it never looks in that sibling
+    # dir — "CUDA Toolkit found" prints successfully, but the later generate
+    # step dies with "CUDA::cublas ... target was not found". A plain
+    # ldconfig/CUDA_HOME existence check (as cudart uses above) isn't enough
+    # here: ldconfig can report a real system-installed libcublas.so that
+    # still lives outside whatever root cmake locked onto, so "found" doesn't
+    # imply cmake can actually use it. _odysseus_cublas_libdir resolves the
+    # directory instead of just a boolean, and _odysseus_link_cublas_into_toolkit
+    # symlinks it into the exact lib dir cmake already resolved cudart from —
+    # reusing cmake's own working root-relative search instead of fighting
+    # FindCUDAToolkit's hint-variable semantics, which vary across versions.
+    runner_lines.append('      _odysseus_cublas_libdir() {')
+    runner_lines.append('        local _cuh="${CUDA_HOME:-/usr/local/cuda}"')
+    runner_lines.append('        local d')
+    runner_lines.append('        for d in "$_cuh/lib64" "$_cuh/lib" /usr/local/cuda/lib64 /usr/local/cuda/lib; do')
+    runner_lines.append('          ls "$d"/libcublas.so* &>/dev/null 2>&1 && { echo "$d"; return 0; }')
+    runner_lines.append('        done')
+    runner_lines.append('        local _cuparent="$(dirname "$_cuh")"')
+    runner_lines.append('        for d in "$_cuparent/cublas/lib" "$_cuparent/cu13/lib" "$_cuparent/cu12/lib"; do')
+    runner_lines.append('          [ -d "$d" ] && ls "$d"/libcublas.so* &>/dev/null 2>&1 && { echo "$d"; return 0; }')
+    runner_lines.append('        done')
+    runner_lines.append('        d="$(ldconfig -p 2>/dev/null | grep \'libcublas\\.so\' | head -1 | sed -n \'s/.*=> //p\')"')
+    runner_lines.append('        [ -n "$d" ] && [ -e "$d" ] && { dirname "$d"; return 0; }')
+    runner_lines.append('        return 1')
+    runner_lines.append('      }')
+    runner_lines.append('      _odysseus_link_cublas_into_toolkit() {')
+    runner_lines.append('        local _src="$1"')
+    runner_lines.append('        local _cuh="${CUDA_HOME:-/usr/local/cuda}"')
+    runner_lines.append('        [ "$_src" = "$_cuh/lib64" ] || [ "$_src" = "$_cuh/lib" ] && return 0')
+    runner_lines.append('        local _target="" d')
+    runner_lines.append('        for d in "$_cuh/lib64" "$_cuh/lib"; do')
+    runner_lines.append('          ls "$d"/libcudart.so* &>/dev/null 2>&1 && { _target="$d"; break; }')
+    runner_lines.append('        done')
+    runner_lines.append('        [ -z "$_target" ] && { _target="$_cuh/lib"; mkdir -p "$_target" 2>/dev/null; }')
+    runner_lines.append('        [ -w "$_target" ] || return 1')
+    runner_lines.append('        local f')
+    runner_lines.append('        for f in "$_src"/libcublas.so*; do')
+    runner_lines.append('          [ -e "$f" ] && ln -sf "$f" "$_target/$(basename "$f")"')
+    runner_lines.append('        done')
+    runner_lines.append('        ls "$_target"/libcublas.so* &>/dev/null 2>&1')
+    runner_lines.append('      }')
+    runner_lines.append('      _odysseus_build_llama_cpu_only() {')
+    runner_lines.append('        rm -rf build')
+    runner_lines.append('        cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$NPROC" --target llama-server')
+    runner_lines.append('      }')
     runner_lines.append('      if _odysseus_has_cudart; then')
-    runner_lines.append('        echo "[odysseus] CUDA nvcc + cudart found — building llama-server with CUDA (GPU) support..."')
-    runner_lines.append('        cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON && cmake --build build -j"$NPROC" --target llama-server && ln -sf ~/llama.cpp/build/bin/llama-server ~/bin/llama-server')
+    runner_lines.append('        _odysseus_cublas_dir="$(_odysseus_cublas_libdir 2>/dev/null || true)"')
+    runner_lines.append('        if [ -n "$_odysseus_cublas_dir" ]; then')
+    runner_lines.append('          _odysseus_link_cublas_into_toolkit "$_odysseus_cublas_dir" || true')
+    runner_lines.append('          mkdir -p ~/.config')
+    runner_lines.append('          echo "export LD_LIBRARY_PATH=\\"$_odysseus_cublas_dir:\\${LD_LIBRARY_PATH:-}\\"" > ~/.config/odysseus-llama-cpp-env')
+    runner_lines.append('          echo "[odysseus] CUDA nvcc + cudart + cublas found (cublas: $_odysseus_cublas_dir) — building llama-server with CUDA (GPU) support..."')
+    runner_lines.append('          if ! (cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON && cmake --build build -j"$NPROC" --target llama-server); then')
+    runner_lines.append('            echo "[odysseus] WARNING: CUDA build failed despite detecting cudart+cublas — falling back to a CPU-only build."')
+    runner_lines.append('            _odysseus_build_llama_cpu_only')
+    runner_lines.append('          fi')
+    runner_lines.append('        else')
+    runner_lines.append('          echo "[odysseus] WARNING: cudart found but CUDA BLAS library (libcublas.so) is not visible anywhere on this host — building llama-server for CPU only."')
+    runner_lines.append('          echo "[odysseus]   GPU inference will not be available for this llama.cpp build."')
+    runner_lines.append('          echo "[odysseus]   This usually means a partial pip-installed CUDA runtime (nvcc+cudart only, no cuBLAS) is on this host."')
+    runner_lines.append('          echo "[odysseus]   Install the full CUDA toolkit, or run: pip install --user nvidia-cublas-cu13 (or -cu12, matching your CUDA major version), then re-launch this serve task."')
+    runner_lines.append('          _odysseus_build_llama_cpu_only')
+    runner_lines.append('        fi')
     runner_lines.append('      else')
     runner_lines.append('        echo "[odysseus] WARNING: nvcc found but CUDA runtime (libcudart.so) is not visible — building llama-server for CPU only."')
     runner_lines.append('        echo "[odysseus]   GPU inference will not be available for this llama.cpp build."')
     runner_lines.append('        echo "[odysseus]   Ensure libcudart is installed (e.g. cuda-runtime package) and visible via ldconfig or CUDA_HOME."')
-    runner_lines.append('        cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$NPROC" --target llama-server && ln -sf ~/llama.cpp/build/bin/llama-server ~/bin/llama-server')
+    runner_lines.append('        _odysseus_build_llama_cpu_only')
     runner_lines.append('      fi')
+    runner_lines.append('      ln -sf ~/llama.cpp/build/bin/llama-server ~/bin/llama-server')
     runner_lines.append('    elif _odysseus_has_vulkan_device && _odysseus_has_vulkan; then')
     runner_lines.append('      echo "[odysseus] Vulkan-capable GPU detected (no ROCm/CUDA toolchain installed) — building llama-server with Vulkan support..."')
     runner_lines.append('      rm -rf build-vulkan')

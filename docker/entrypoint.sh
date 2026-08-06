@@ -100,6 +100,15 @@ for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local; do
     repair_bind_mount_ownership "$dir"
 done
 
+# /app/.cache itself is pruned above (only its huggingface child is a bind
+# mount, repaired in the loop) but Docker auto-creates the parent as root:root
+# when it materializes the huggingface bind mount, before this script ever
+# runs. That leaves the non-root app user unable to create *any other* cache
+# subdir there (vllm, flashinfer, pip, uv, ...), which crashes Cookbook-served
+# engines with PermissionError on first launch. Non-recursive: the
+# huggingface child's ownership is already handled above.
+[ -d /app/.cache ] && chown "$PUID:$PGID" /app/.cache 2>/dev/null || true
+
 # Cookbook installs vllm/etc. via `pip install --user`, which pulls
 # nvidia-cuda-* wheels into /app/.local but does not set CUDA_HOME or
 # symlink /usr/local/cuda. vllm 0.22+ then crashes during engine init
